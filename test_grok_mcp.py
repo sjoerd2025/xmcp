@@ -18,7 +18,7 @@ def load_env() -> None:
 
 
 def get_xai_config() -> tuple[str, str]:
-    api_key = "xai-CuickQkYFXuZuG1hQLaSckBrEcqjjnc2BwktRIWAIoOw3ebBtPWziWRjfVq6Wm3zjT9zQFcc4kFXFWRP"
+    api_key = os.getenv("XAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Set XAI_API_KEY to call Grok.")
     model = os.getenv("XAI_MODEL", "grok-4-1-fast")
@@ -27,7 +27,7 @@ def get_xai_config() -> tuple[str, str]:
 
 def main() -> None:
     load_env()
-    server_url = "https://dell-cryptovolcanic-southeastwardly.ngrok-free.dev/mcp"
+    server_url = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/mcp")
     api_key, model = get_xai_config()
 
     client = Client(api_key=api_key)

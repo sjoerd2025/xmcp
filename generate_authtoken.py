@@ -10,15 +10,22 @@ Required env vars: CLIENT_ID, CLIENT_SECRET
 
 import os
 import json
+from pathlib import Path
+
+from dotenv import load_dotenv
 from xdk import Client
 from xdk.oauth2_auth import OAuth2PKCEAuth
 
-# The code below sets the client ID and client secret from your environment variables
-# To set environment variables on macOS or Linux, run the export commands below from the terminal:
-# export CLIENT_ID='YOUR-CLIENT-ID'
-# export CLIENT_SECRET='YOUR-CLIENT-SECRET'
-client_id = "cHducUxsTXFwMWRRcUNNNkRtNG06MTpjaQ"
-client_secret = "O_t-zgWkuUwQYXRsCb6m5yjjF8KWRM3_RDfxdaBHVZ1sGku426"
+# Load variables from a local .env file (or existing environment variables).
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+client_id = os.getenv("CLIENT_ID")
+client_secret = os.getenv("CLIENT_SECRET")
+
+if not client_id or not client_secret:
+    raise RuntimeError(
+        "Missing CLIENT_ID or CLIENT_SECRET. Add them to .env or export them."
+    )
 
 # Replace the following URL with your callback URL, which can be obtained from your App's auth settings.
 redirect_uri = "https://example.org"
