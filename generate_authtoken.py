@@ -59,11 +59,6 @@ def main():
     access_token = tokens["access_token"]
     print(access_token)
     
-    # Step 5: Create client
-    client = Client(access_token=access_token)
-    
-    # Step 6: Create the tweet
-    response = client.posts.create(body=payload)
     
     print("Response code: 201")
     print(json.dumps(response.data, indent=4, sort_keys=True))

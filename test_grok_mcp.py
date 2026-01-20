@@ -42,7 +42,7 @@ def main() -> None:
     )
 
     chat.append(
-        user('find users who work at the company anthropic. this can include c-suite executives, engineers, and more. ensure that you only include CURRENT employees. fetch as many as you can possibly find please.')
+        user('dm @santiagomed the message "this is a test message".')
     )
 
     print("Starting chat stream...\n")
