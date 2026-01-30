@@ -21,7 +21,7 @@ def get_xai_config() -> tuple[str, str]:
     api_key = os.getenv("XAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Set XAI_API_KEY to call Grok.")
-    model = os.getenv("XAI_MODEL", "grok-4-1-fast")
+    model = os.getenv("XAI_MODEL", "grok-4-1-fast-reasoning")
     return api_key, model
 
 
@@ -42,7 +42,7 @@ def main() -> None:
     )
 
     chat.append(
-        user('dm @santiagomed the message "this is a test message".')
+        user('dm @taycaldwell the message "bot.grokcommand sent this message with xMCP". If we receive an error please explicity inform us what the error is. This incldues trace ids.')
     )
 
     print("Starting chat stream...\n")

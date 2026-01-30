@@ -1,10 +1,19 @@
 import copy
+import http.server
 import json
 import logging
 import os
+import socketserver
+import threading
+import time
+import urllib.parse
+import webbrowser
 from pathlib import Path
 
 import httpx
+import requests
+from oauthlib.oauth1 import Client as OAuth1Client
+from requests_oauthlib import OAuth1Session
 from fastmcp import FastMCP
 
 HTTP_METHODS = {
@@ -19,6 +28,11 @@ HTTP_METHODS = {
 }
 
 LOGGER = logging.getLogger("xmcp.x_api")
+OAUTH_LOGGER = logging.getLogger("xmcp.oauth1")
+
+REQUEST_TOKEN_URL = "https://api.x.com/oauth/request_token"
+AUTHORIZE_URL = "https://api.x.com/oauth/authorize"
+ACCESS_TOKEN_URL = "https://api.x.com/oauth/access_token"
 
 
 def is_truthy(value: str | None) -> bool:
@@ -70,9 +84,123 @@ def collect_comma_params(spec: dict) -> set[str]:
 
 
 def load_openapi_spec() -> dict:
-    spec_path = Path(__file__).resolve().parent / "openapi.json"
-    with spec_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    url = "https://api.twitter.com/2/openapi.json"
+    LOGGER.info("Fetching OpenAPI spec from %s", url)
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def _get_env_int(key: str, default: int) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"{key} must be an integer value.")
+
+
+def _callback_url(host: str, port: int, path: str) -> str:
+    return f"http://{host}:{port}{path}"
+
+
+def _wait_for_callback(
+    host: str, port: int, path: str, timeout_seconds: int
+) -> tuple[str, str]:
+    params: dict[str, str | None] = {"oauth_token": None, "oauth_verifier": None}
+    event = threading.Event()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != path:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not found.")
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            params["oauth_token"] = (query.get("oauth_token") or [None])[0]
+            params["oauth_verifier"] = (query.get("oauth_verifier") or [None])[0]
+            event.set()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OAuth complete. You may close this tab.")
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            OAUTH_LOGGER.debug("OAuth1 callback: " + format, *args)
+
+    class _Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    server = _Server((host, port), _Handler)
+    server.timeout = 1
+
+    deadline = time.time() + timeout_seconds
+    try:
+        while time.time() < deadline:
+            server.handle_request()
+            if event.is_set():
+                break
+    finally:
+        server.server_close()
+
+    oauth_token = params.get("oauth_token")
+    oauth_verifier = params.get("oauth_verifier")
+    if not oauth_token or not oauth_verifier:
+        raise TimeoutError("OAuth callback not received before timeout.")
+    return oauth_token, oauth_verifier
+
+
+def run_oauth1_flow() -> tuple[str, str]:
+    consumer_key = os.getenv("TWITTER_CONSUMER_KEY")
+    consumer_secret = os.getenv("TWITTER_CONSUMER_SECRET")
+    if not consumer_key or not consumer_secret:
+        raise RuntimeError(
+            "Missing TWITTER_CONSUMER_KEY or TWITTER_CONSUMER_SECRET for OAuth1 flow."
+        )
+
+    callback_host = os.getenv("X_OAUTH_CALLBACK_HOST", "127.0.0.1")
+    callback_port = _get_env_int("X_OAUTH_CALLBACK_PORT", 8976)
+    callback_path = os.getenv("X_OAUTH_CALLBACK_PATH", "/oauth/callback")
+    callback_timeout = _get_env_int("X_OAUTH_CALLBACK_TIMEOUT", 300)
+
+    callback_url = _callback_url(callback_host, callback_port, callback_path)
+
+    oauth = OAuth1Session(
+        client_key=consumer_key,
+        client_secret=consumer_secret,
+        callback_uri=callback_url,
+    )
+    request_token = oauth.fetch_request_token(REQUEST_TOKEN_URL)
+    resource_owner_key = request_token.get("oauth_token")
+    resource_owner_secret = request_token.get("oauth_token_secret")
+    if not resource_owner_key or not resource_owner_secret:
+        raise RuntimeError("Failed to obtain OAuth request token.")
+
+    authorization_url = oauth.authorization_url(AUTHORIZE_URL)
+    OAUTH_LOGGER.info("Opening browser for OAuth1 consent.")
+    webbrowser.open(authorization_url)
+
+    oauth_token, oauth_verifier = _wait_for_callback(
+        callback_host, callback_port, callback_path, callback_timeout
+    )
+    if oauth_token != resource_owner_key:
+        raise RuntimeError("OAuth callback token does not match request token.")
+
+    oauth = OAuth1Session(
+        client_key=consumer_key,
+        client_secret=consumer_secret,
+        resource_owner_key=resource_owner_key,
+        resource_owner_secret=resource_owner_secret,
+        verifier=oauth_verifier,
+    )
+    access_token = oauth.fetch_access_token(ACCESS_TOKEN_URL)
+    access_key = access_token.get("oauth_token")
+    access_secret = access_token.get("oauth_token_secret")
+    if not access_key or not access_secret:
+        raise RuntimeError("Failed to obtain OAuth access token.")
+    return access_key, access_secret
 
 
 def load_env() -> None:
@@ -83,7 +211,7 @@ def load_env() -> None:
         from dotenv import load_dotenv
     except ImportError:
         return
-    load_dotenv(env_path)
+    load_dotenv(env_path, override=True)
 
 
 def setup_logging() -> bool:
@@ -168,15 +296,33 @@ def print_tool_list(spec: dict) -> None:
         print(f"- {tool}")
 
 
-def get_auth_headers() -> dict:
-    oauth_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
+def get_auth_headers(oauth_token: str | None = None) -> dict:
+    env_oauth_token = os.getenv("X_OAUTH_ACCESS_TOKEN", "").strip()
     bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
-    token = oauth_token or bearer_token
+    token = oauth_token or env_oauth_token or bearer_token
     if not token:
         raise RuntimeError(
-            "Set X_OAUTH_ACCESS_TOKEN or X_BEARER_TOKEN to authenticate with the X API."
+            "Set X_BEARER_TOKEN or provide OAuth1 access token on startup."
         )
     return {"Authorization": f"Bearer {token}"}
+
+
+def build_oauth1_client() -> OAuth1Client:
+    consumer_key = os.getenv("TWITTER_CONSUMER_KEY")
+    consumer_secret = os.getenv("TWITTER_CONSUMER_SECRET")
+    if not consumer_key or not consumer_secret:
+        raise RuntimeError(
+            "Missing TWITTER_CONSUMER_KEY or TWITTER_CONSUMER_SECRET for OAuth1 signing."
+        )
+    access_token, access_secret = run_oauth1_flow()
+    LOGGER.info("OAuth1 access token: %s", access_token)
+    return OAuth1Client(
+        client_key=consumer_key,
+        client_secret=consumer_secret,
+        resource_owner_key=access_token,
+        resource_owner_secret=access_secret,
+        signature_type="AUTH_HEADER",
+    )
 
 
 def create_mcp() -> FastMCP:
@@ -188,6 +334,8 @@ def create_mcp() -> FastMCP:
 
     base_url = os.getenv("X_API_BASE_URL", "https://api.x.com")
     timeout = float(os.getenv("X_API_TIMEOUT", "30"))
+
+    oauth1_client = build_oauth1_client()
 
     spec = load_openapi_spec()
     filtered_spec = filter_openapi_spec(spec)
@@ -224,6 +372,25 @@ def create_mcp() -> FastMCP:
 
         request.url = request.url.copy_with(params=normalized)
 
+    b3_flags = os.getenv("X_B3_FLAGS", "1")
+
+    async def sign_oauth1_request(request: httpx.Request) -> None:
+        request.headers["X-B3-Flags"] = b3_flags
+        headers = dict(request.headers)
+        content_type = headers.get("Content-Type", "")
+        body: str | None = None
+        if content_type.startswith("application/x-www-form-urlencoded"):
+            body_bytes = request.content or b""
+            body = body_bytes.decode("utf-8")
+        signed_url, signed_headers, _ = oauth1_client.sign(
+            str(request.url),
+            http_method=request.method,
+            body=body,
+            headers=headers,
+        )
+        request.url = httpx.URL(signed_url)
+        request.headers.update(signed_headers)
+
     async def log_request(request: httpx.Request) -> None:
         if not debug_enabled:
             return
@@ -239,6 +406,9 @@ def create_mcp() -> FastMCP:
             response.status_code,
         )
         if response.status_code >= 400:
+            transaction_id = response.headers.get("x-transaction-id")
+            if transaction_id:
+                LOGGER.warning("X API x-transaction-id: %s", transaction_id)
             body = await response.aread()
             text = body.decode("utf-8", errors="replace")
             if len(text) > 1000:
@@ -247,10 +417,10 @@ def create_mcp() -> FastMCP:
 
     client = httpx.AsyncClient(
         base_url=base_url,
-        headers=get_auth_headers(),
+        headers={},
         timeout=timeout,
         event_hooks={
-            "request": [normalize_query_params, log_request],
+            "request": [normalize_query_params, sign_oauth1_request, log_request],
             "response": [log_response],
         },
     )
